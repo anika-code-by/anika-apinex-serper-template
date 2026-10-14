@@ -1,10 +1,11 @@
-const DEFAULT_MODEL = "gemini-3.5-flash-lite";
+const DEFAULT_MODEL = "free/gemini-3.8-flash";
+const APINEX_API_URL = "https://api.apinex.bond/v1/chat/completions";
 const MAX_HISTORY_MESSAGES = 8;
 const MAX_HISTORY_MESSAGE_CHARS = 1200;
 const MAX_ALICE_TEXT = 1024;
 const TOTAL_RESPONSE_BUDGET_MS = 3600;
 const SERPER_TIMEOUT_MS = 600;
-const GEMINI_TIMEOUT_MS = 2500;
+const APINEX_TIMEOUT_MS = 2500;
 
 const SYSTEM_PROMPT = [
   "Ты — полезный голосовой помощник в навыке Яндекс Алисы.",
@@ -52,7 +53,7 @@ function isSearchIntent(text) {
 function safeHistory(history) {
   if (!Array.isArray(history)) return [];
   return history
-    .filter(item => item && (item.role === "user" || item.role === "model") && typeof item.text === "string")
+    .filter(item => item && (item.role === "user" || item.role === "model" || item.role === "assistant") && typeof item.text === "string")
     .slice(-MAX_HISTORY_MESSAGES)
     .map(item => ({ role: item.role, text: item.text.slice(0, MAX_HISTORY_MESSAGE_CHARS) }));
 }
@@ -110,76 +111,96 @@ async function searchWeb(query, timeoutMs) {
   }
 }
 
-async function askGemini(text, history, searchContext, timeoutMs) {
-  const key = process.env.GEMINI_API_KEY;
-  if (!key) throw new Error("MISSING_GEMINI_KEY");
+async function askApinex(text, history, searchContext, timeoutMs) {
+  const key = process.env.APINEX_API_KEY || process.env.GEMINI_API_KEY;
+  if (!key) throw new Error("MISSING_API_KEY");
   if (timeoutMs < 250) throw new Error("TIME_BUDGET_EXHAUSTED");
 
-  const model = String(process.env.GEMINI_MODEL || DEFAULT_MODEL).trim();
-  if (!/^[A-Za-z0-9._-]+$/.test(model)) throw new Error("INVALID_MODEL_NAME");
+  const model = String(process.env.APINEX_MODEL || process.env.GEMINI_MODEL || DEFAULT_MODEL).trim();
+  if (!/^[A-Za-z0-9._\/-]+$/.test(model)) throw new Error("INVALID_MODEL_NAME");
 
-  const contents = safeHistory(history).map(item => ({
-    role: item.role,
-    parts: [{ text: item.text }]
-  }));
+  const messages = [
+    { role: "system", content: SYSTEM_PROMPT }
+  ];
+
+  for (const item of safeHistory(history)) {
+    messages.push({
+      role: item.role === "model" ? "assistant" : item.role,
+      content: item.text
+    });
+  }
 
   const prompt = searchContext
     ? `${text}\n\nРезультаты поиска в интернете:\n${searchContext}\nИспользуй их только там, где они относятся к вопросу.`
     : text;
-  contents.push({ role: "user", parts: [{ text: prompt }] });
+  messages.push({ role: "user", content: prompt });
 
   const { response, data } = await fetchJson(
-    `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`,
+    APINEX_API_URL,
     {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
-        "x-goog-api-key": key
+        "Authorization": `Bearer ${key}`
       },
       body: JSON.stringify({
-        systemInstruction: { parts: [{ text: SYSTEM_PROMPT }] },
-        contents,
-        generationConfig: {
-          temperature: 0.5,
-          maxOutputTokens: 240
-        }
+        model,
+        messages,
+        temperature: 0.5,
+        max_tokens: 240
       })
     },
-    Math.min(GEMINI_TIMEOUT_MS, timeoutMs)
+    Math.min(APINEX_TIMEOUT_MS, timeoutMs)
   );
 
   if (!response.ok) {
     const status = Number(response.status);
-    console.error("Gemini request failed with HTTP", status);
-    if (status === 401 || status === 403) throw new Error("GEMINI_KEY_REJECTED");
-    if (status === 429) throw new Error("GEMINI_QUOTA");
-    throw new Error("GEMINI_REQUEST_FAILED");
+    console.error("APInex request failed with HTTP", status, data);
+    if (status === 401 || status === 403) throw new Error("API_KEY_REJECTED");
+    if (status === 402) throw new Error("API_PAYMENT_REQUIRED");
+    if (status === 429) throw new Error("API_QUOTA");
+    throw new Error("API_REQUEST_FAILED");
   }
 
-  const candidate = data?.candidates?.[0];
-  const answer = (candidate?.content?.parts || [])
-    .map(part => typeof part.text === "string" ? part.text : "")
-    .join("")
-    .trim();
+  const choice = data?.choices?.[0];
+  let answer = "";
+  if (typeof choice?.message?.content === "string") {
+    answer = choice.message.content.trim();
+  } else if (Array.isArray(choice?.message?.content)) {
+    answer = choice.message.content
+      .map(part => (typeof part === "string" ? part : part?.text || ""))
+      .join("")
+      .trim();
+  }
+  if (!answer && typeof choice?.message?.reasoning_content === "string") {
+    answer = choice.message.reasoning_content.trim();
+  }
 
   if (!answer) {
-    if (data?.promptFeedback?.blockReason) throw new Error("GEMINI_BLOCKED");
-    throw new Error("GEMINI_EMPTY_RESPONSE");
+    throw new Error("API_EMPTY_RESPONSE");
   }
-  if (candidate?.finishReason === "MAX_TOKENS") {
-    console.warn("Gemini reached the output token limit.");
+  if (choice?.finish_reason === "length") {
+    console.warn("APInex model reached the output token limit.");
   }
   return answer;
 }
 
+const askGemini = askApinex;
+
 function errorForUser(error) {
   switch (error?.message) {
+    case "MISSING_API_KEY":
     case "MISSING_GEMINI_KEY":
-      return "Сервер пока не настроен. Проверьте переменную GEMINI_API_KEY в настройках Vercel.";
+      return "Сервер пока не настроен. Проверьте переменную APINEX_API_KEY в настройках Vercel.";
+    case "API_KEY_REJECTED":
     case "GEMINI_KEY_REJECTED":
-      return "Не удалось подключиться к Gemini. Проверьте API-ключ в настройках Vercel.";
+      return "Не удалось подключиться к нейросети APInex. Проверьте API-ключ в настройках Vercel.";
+    case "API_PAYMENT_REQUIRED":
+      return "На балансе APInex закончились средства или лимит токенов.";
+    case "API_QUOTA":
     case "GEMINI_QUOTA":
-      return "Сейчас превышен лимит запросов к Gemini. Попробуйте немного позже.";
+      return "Сейчас превышен лимит запросов к нейросети. Попробуйте немного позже.";
+    case "API_BLOCKED":
     case "GEMINI_BLOCKED":
       return "Я не смогла обработать этот запрос. Попробуйте спросить иначе.";
     case "TIME_BUDGET_EXHAUSTED":
@@ -194,7 +215,7 @@ export default async function handler(req, res) {
   if (req.method === "GET") {
     return res.status(200).json({
       ok: true,
-      service: "alice-gemini-serper",
+      service: "alice-apinex-serper",
       message: "Webhook is ready. Yandex Dialogs should send POST requests to /api."
     });
   }
@@ -225,11 +246,11 @@ export default async function handler(req, res) {
       searchContext = await searchWeb(text, Math.min(SERPER_TIMEOUT_MS, Math.max(0, remainingMs() - 2600)));
     }
 
-    const answer = await askGemini(
+    const answer = await askApinex(
       text,
       oldHistory,
       searchContext,
-      Math.max(0, Math.min(GEMINI_TIMEOUT_MS, remainingMs() - 600))
+      Math.max(0, Math.min(APINEX_TIMEOUT_MS, remainingMs() - 600))
     );
 
     const history = [
@@ -246,4 +267,4 @@ export default async function handler(req, res) {
   }
 }
 
-export { aliceResponse, fitAliceText, isSearchIntent, safeHistory };
+export { aliceResponse, fitAliceText, isSearchIntent, safeHistory, askApinex, askGemini };

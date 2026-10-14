@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { aliceResponse, fitAliceText, isSearchIntent, safeHistory } from "../api/index.js";
+import { aliceResponse, fitAliceText, isSearchIntent, safeHistory, askApinex, askGemini } from "../api/index.js";
 
 test("Alice response uses required response envelope", () => {
   const result = aliceResponse("Привет", false, [{ role: "user", text: "тест" }]);
@@ -22,8 +22,8 @@ test("long responses are cut at a natural boundary and stay within Alice limit",
   assert.ok(value.endsWith("."));
 });
 
-test("history filters malformed messages and keeps last 8", () => {
-  const input = Array.from({ length: 12 }, (_, i) => ({ role: i % 2 ? "model" : "user", text: String(i) }));
+test("history filters malformed messages and keeps last 8 with user/model/assistant roles", () => {
+  const input = Array.from({ length: 12 }, (_, i) => ({ role: i % 2 ? "assistant" : "user", text: String(i) }));
   input.push({ role: "hacker", text: "ignore" }, { role: "user", text: 17 });
   const result = safeHistory(input);
   assert.equal(result.length, 8);
@@ -43,7 +43,7 @@ test("GET health check returns an ok response", async () => {
   await handler({ method: "GET" }, res);
   assert.equal(statusCode, 200);
   assert.equal(payload.ok, true);
-  assert.equal(payload.service, "alice-gemini-serper");
+  assert.equal(payload.service, "alice-apinex-serper");
 });
 
 test("launch request returns a valid Alice greeting without external API keys", async () => {
@@ -60,4 +60,23 @@ test("launch request returns a valid Alice greeting without external API keys", 
   assert.equal(payload.version, "1.0");
   assert.match(payload.response.text, /Привет/);
   assert.equal(payload.response.end_session, false);
+});
+
+test("askApinex throws error when API key is missing", async () => {
+  const oldKey1 = process.env.APINEX_API_KEY;
+  const oldKey2 = process.env.GEMINI_API_KEY;
+  delete process.env.APINEX_API_KEY;
+  delete process.env.GEMINI_API_KEY;
+  try {
+    await assert.rejects(async () => {
+      await askApinex("Привет", [], "", 1000);
+    }, { message: "MISSING_API_KEY" });
+  } finally {
+    if (oldKey1) process.env.APINEX_API_KEY = oldKey1;
+    if (oldKey2) process.env.GEMINI_API_KEY = oldKey2;
+  }
+});
+
+test("askGemini alias is exported and points to askApinex", () => {
+  assert.equal(askGemini, askApinex);
 });
